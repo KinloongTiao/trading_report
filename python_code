@@ -1,0 +1,596 @@
+#!/usr/bin/python
+# author: Jinlong Diao
+# -*- coding: UTF-8 -*-
+# client.py
+
+import requests
+import json
+import time as ti
+from datetime import datetime, timedelta
+import numpy as np
+import pandas as pd
+from os.path import basename
+import os
+import hmac
+import hashlib
+import xlrd
+import xlwt
+import smtplib
+from smtplib import SMTP_SSL
+import gc
+import os
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+from os.path import basename
+from xlutils.copy import copy
+
+
+class Dailyreport:
+
+    def create_signature(self, key, message):
+        # 加密方法为hmac sha256
+        signature = hmac.new(key, message, hashlib.sha256).hexdigest()
+
+        return signature
+
+    def time_check(self):
+
+        # 检查本地时间与服务器时间的时间间隔，间隔不能超过5秒
+        # 已调整： -50 m-seconds
+        url_time = 'https://p.kryptono.exchange/k/api/v2/time'
+        res_time = requests.get(url_time)
+        data = res_time.json()
+        now = int(ti.time() * 1000) - 50
+        time_diff = data['server_time'] - now
+        print('响应时间差：', time_diff)
+        str_now = str(now)
+
+        return now, str_now
+
+    def get_balance(self, apiKey, secretKey, account_name):
+        # now, str_now = self.time_check()
+
+        now = int(ti.time() * 1000) - 50
+        str_now = str(now)
+        massage = 'timestamp=' + str_now + '&recvWindow=5000'
+
+        url = 'https://p.kryptono.exchange/k/api/v2/account/balances?' + massage
+        balance_sign = self.create_signature(secretKey.encode(), massage.encode())
+
+        headers = {'Authorization': apiKey, 'Signature': balance_sign, 'X-Requested-With': 'XMLHttpRequest'}
+        res = requests.get(url, headers=headers)
+        data = res.json()
+        print(data)
+        res.close()
+        print('====================')
+
+        try:
+            data = pd.DataFrame(data)
+            # print(data)
+        except ValueError:
+            pass
+        print('====================')
+
+        data = np.array(data)
+        # print(data)
+        data = np.delete(data, [0, 1, 3], axis=1)
+        # print('data')
+        data = pd.DataFrame(data)
+        data = data.rename(columns={0: 'Currency_code', 1: 'Balance'})
+
+        data = data[data['Balance'] != '0']
+        data = data.reset_index()
+
+        return data
+
+    def sym_sum(self, account_name):
+
+        for account in account_name:
+
+            data = xlrd.open_workbook(dir_path + filename)
+            names = data.sheet_names()
+            currency_pair = names[0:len(names)]
+
+            volume = []
+
+            for i in range(len(names)):
+                if names[i] == 'Balance':
+                    continue
+                else:
+                    table = pd.read_excel(dir_path + filename, sheet_name=names[i])
+                    volume.append(table.quantity.sum())
+
+        return currency_pair, volume
+
+    def get_trade_list(self, apiKey, secretKey, account_name, sym):
+
+        now = int(ti.time() * 1000)
+        str_now = str(now)
+
+        payload = '{"symbol":' + sym + ',"limit":100,"timestamp":' + str_now + ',"recvWindow":5000}'
+        url = 'https://p.kryptono.exchange/k/api/v2/order/list/trades'
+
+        trade_sign = self.create_signature(secretKey.encode(), payload.encode())
+        headers = {"Authorization": apiKey,"Signature": trade_sign, "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest"}
+
+        res = requests.post(url, headers=headers, data=payload)
+        data = res.json()
+        # print(data)
+        print('now is ', account_name, sym)
+        now = int(ti.time() * 1000)
+        yesterday = now - 24 * 3600 * 1000
+
+        data = pd.DataFrame(data)
+        data.to_excel(dir_path + 'test.xls')
+        data = np.array(data)
+
+        time_stamp = data[:, 7].astype(np.float64)
+
+        if time_stamp[0] < yesterday:
+            print('过去1day没有交易数据')
+            return []
+        else:
+            data = data[data[:, 7].astype(np.float64) >= yesterday, :]
+            # sum_quantity = data[:, 7].astype(np.float64).sum()
+            data = pd.DataFrame(data)
+            data = data.rename(columns={0: 'fee', 1: 'hex_id', 2: 'order_id', 3: 'order_side', 4: 'price', 5: 'quantity',6: 'symbol', 7: 'timestamp', 8: 'total'})
+
+            return data
+
+
+    def first_loop(self, keydict, account_name, symbol):
+
+        # 此函数是用于每天生成第一份底稿，方便后续覆盖操作
+        for i in range(len(account_name)):
+
+            writer = pd.ExcelWriter(dir_path + filename)
+
+            # balance_data = self.get_balance(keydict['apiKey'][i], keydict['apiSecret'][i], account_name[i])
+            # balance_data.to_excel(excel_writer=writer, sheet_name='Balance', header=True, index=False)
+
+            for sym in symbol:
+
+                trade_data = self.get_trade_list(keydict['apiKey'][i], keydict['apiSecret'][i], account_name[i], sym)
+                try:
+                    if trade_data.empty:
+                        print("df is empty")
+                    else:
+                        trade_data = self.get_trade_list(keydict['apiKey'][i], keydict['apiSecret'][i], account_name[i],sym)
+
+                        timelist = []
+                        for m in trade_data['timestamp']:
+                            timestamp = int(m)
+                            # 转换成localtime
+                            time_local = ti.localtime(int(timestamp / 1000))
+                            # 转换成新的时间格式(2016-05-05 20:28:54)
+                            dt = ti.strftime("%Y-%m-%d %H:%M:%S", time_local)
+                            timelist.append(dt)
+
+                        trade_data['timestamp'] = timelist
+                        trade_data.pop('fee')
+                        trade_data.pop('hex_id')
+
+                        trade_data.to_excel(excel_writer=writer, sheet_name=sym, header=True, index = False)
+
+                except AttributeError:
+                    pass
+
+            writer.save()
+
+    def writeExcel(self, keydict, account_name, symbol):
+
+        # 循环读取交易数据，并覆盖在原有数据的上面，去重，去index，生成新表
+        for i in range(len(account_name)):
+
+            writer = pd.ExcelWriter(dir_path + filename)
+
+            # balance_data = self.get_balance(keydict['apiKey'][i], keydict['apiSecret'][i], account_name[i])
+            # balance_data.to_excel(excel_writer=writer, sheet_name='Balance', header=True, index = False)
+
+
+            for sym in symbol:
+
+                # trade_data = self.get_trade_list(keydict['apiKey'][i], keydict['apiSecret'][i], account_name[i], sym)
+
+                while True:
+                    try:
+                        trade_data = self.get_trade_list(keydict['apiKey'][i], keydict['apiSecret'][i], account_name[i], sym)
+                        break
+                    except Exception as e:
+
+                        print('Wrong,try agian!',sym)
+                        print('Error:', e)
+                        ti.sleep(5)
+
+
+                try:
+                    # if trade_data.empty:
+                    #     print("df is empty")
+                    # else:
+                    old_trade_data = pd.read_excel(dir_path + filename, sheet_name=sym)
+                    timelist = []
+                    for m in trade_data['timestamp']:
+                        timestamp = int(m)
+                        # 转换成localtime
+                        time_local = ti.localtime(int(timestamp / 1000))
+                        # 转换成新的时间格式(2016-05-05 20:28:54)
+                        dt = ti.strftime("%Y-%m-%d %H:%M:%S", time_local)
+                        timelist.append(dt)
+
+                    trade_data['timestamp'] = timelist
+
+                    trade_data.pop('fee')
+                    trade_data.pop('hex_id')
+
+                    data = pd.concat([trade_data, old_trade_data], axis=0, ignore_index=True)
+                    data = data.drop_duplicates('order_id')
+
+                    print(len(data))
+                    data.to_excel(excel_writer=writer, sheet_name=sym, header=True, index = False)
+
+                except AttributeError:
+                    pass
+
+
+            #
+            # for sym in symbol:
+            #
+            #     trade_data = self.get_trade_list(keydict['apiKey'][i], keydict['apiSecret'][i], account_name[i], sym)
+            #     try:
+            #         if trade_data.empty:
+            #             print("df is empty")
+            #         else:
+            #             old_trade_data = pd.read_excel(dir_path + filename, sheet_name=sym)
+            #             timelist = []
+            #             for m in trade_data['timestamp']:
+            #                 timestamp = int(m)
+            #                 # 转换成localtime
+            #                 time_local = ti.localtime(int(timestamp / 1000))
+            #                 # 转换成新的时间格式(2016-05-05 20:28:54)
+            #                 dt = ti.strftime("%Y-%m-%d %H:%M:%S", time_local)
+            #                 timelist.append(dt)
+            #
+            #             trade_data['timestamp'] = timelist
+            #
+            #             trade_data.pop('fee')
+            #             trade_data.pop('hex_id')
+            #
+            #             data = pd.concat([trade_data, old_trade_data], axis=0, ignore_index=True)
+            #             data = data.drop_duplicates('order_id')
+            #
+            #             print(len(data))
+            #             data.to_excel(excel_writer=writer, sheet_name=sym, header=True, index = False)
+            #
+            #     except AttributeError:
+            #         pass
+
+            writer.save()
+
+    def sendemail_to_clients(self):
+
+        while True:
+            try:
+                balance_data = self.get_balance(keydict['apiKey'][0], keydict['apiSecret'][0], account_name[0])
+                balance_data_code = np.array(balance_data['Currency_code']).tolist()
+                balance_data_bal = np.array(balance_data['Balance']).tolist()
+                print('Current balance has been writed!')
+                break
+            except:
+                pass
+
+        currency_pair, volume = self.sym_sum(account_name)
+
+
+        while True:
+            try:
+                today_balance_huo1 = self.get_balance(keydict_huo['apiKey'][0], keydict_huo['apiSecret'][0],account_name_huo[0])
+                balance_data_code_huo = np.array(today_balance_huo1['Currency_code']).tolist()
+                balance_data_bal_1 = np.array(today_balance_huo1['Balance'],dtype=np.float)
+
+                today_balance_huo2 = self.get_balance(keydict_huo['apiKey'][1], keydict_huo['apiSecret'][1],account_name_huo[1])
+                balance_data_bal_2 = np.array(today_balance_huo2['Balance'],dtype=np.float)
+
+                today_balance_huo = balance_data_bal_1 + balance_data_bal_2
+                print('Current balance of Huo has been writed! Wonderful.')
+                break
+            except:
+                pass
+
+
+
+        mail_host = "smtp.exmail.qq.com"  # 设置服务器
+        mail_user = "noreply@amberaigroup.com"  # 用户名
+        mail_pass = "amberAI$nr1"  # 口令
+
+        sender = 'noreply@amberaigroup.com'
+        # to = 'trading@amberaigroup.com'
+        mail_to = ['celeste@kryptono.exchange','david@kryptono.exchange','william@kryptono.exchange','charles@kryptono.exchange']
+
+
+        receivers = ['celeste@kryptono.exchange', 'david@kryptono.exchange', 'william@kryptono.exchange', 'charles@kryptono.exchange']  # 接收邮件，可设置为你的QQ邮箱或者其他邮箱
+        # receivers = ['luke.li@amberaigroup.com']  # 接收邮件，可设置为你的QQ邮箱或者其他邮箱
+        receivers = ['11510422@mail.sustc.edu.cn']  # 接收邮件，可设置为你的QQ邮箱或者其他邮箱
+
+        cc = ['trading@amberaigroup.com', 'norelle.ng@amberaigroup.com', 'luke.li@amberaigroup.com']
+        cc1 = ['445609506@qq.com']
+
+
+        server = smtplib.SMTP_SSL(mail_host)
+        server.set_debuglevel(1)
+        server.ehlo(mail_host)
+        server.ehlo()
+
+        server.login(mail_user, mail_pass)
+        msg = MIMEMultipart()
+
+        msg['From'] = sender
+        # msg['To'] = to
+        msg['To'] = ','.join(mail_to)
+        now = datetime.now().strftime('%Y-%m-%d')
+        msg['Subject'] = "KRYPTONO-AMBER MARKET MAKING_" + now
+
+        part = MIMEText('Hi team,\n\nPlease find detailed trades report below and attached.\n')
+        msg.attach(part)
+        part = MIMEText('Exchange Market Making Balance:\n')
+        msg.attach(part)
+        for i in range(len(balance_data_code)):
+            part = MIMEText(str(balance_data_code[i])+'   '+str(balance_data_bal[i])[0:7])
+            msg.attach(part)
+        part = MIMEText('\n24h VOLUME:\n')
+        msg.attach(part)
+        for i in range(len(currency_pair)):
+            part = MIMEText(str(currency_pair[i])+'  '+str(round(volume[i],3)))
+            msg.attach(part)
+
+        part = MIMEText('\nKNOW Market Making Balance:\n')
+        msg.attach(part)
+        part = MIMEText('             ' + 'Yesterday' + '      ' + 'Today')
+        msg.attach(part)
+
+        for i in range(len(balance_data_code_huo)):
+            if i == 2:
+                part = MIMEText(str(balance_data_code_huo[i])+'   '+str(original_balance_huo[i])[0:7] + '     ' + str(today_balance_huo[i])[0:7])
+                msg.attach(part)
+            else:
+                part = MIMEText(str(balance_data_code_huo[i])+'       '+str(original_balance_huo[i])[0:7] + '      ' + str(today_balance_huo[i])[0:7])
+                msg.attach(part)
+
+
+        part = MIMEText('\n[THIS IS AN AUTOMATED MESSAGE - PLEASE DO NOT REPLY DIRECTLY TO THIS EMAIL]')
+        msg.attach(part)
+
+        file_dir = '/home/user/LUKE_Daily_Report/'
+        print(file_dir)
+
+        filelist = []
+        for files in os.walk(file_dir):
+            filelist.append(files)
+
+        filelist = filelist[0][2]
+
+        for file in filelist:
+            print(file_dir + file)
+            with open(file_dir + file, "rb") as fil:
+                part = MIMEText(fil.read(), 'base64', 'utf-8')
+                part["Content-Type"] = 'application/octet-stream'
+                part['Content-Disposition'] = 'attachment; filename="%s"' % basename(file)
+                msg.attach(part)
+
+        text = msg.as_string()
+        server.sendmail(sender, receivers, text)
+        server.sendmail(sender, cc, text)
+        server.sendmail(sender, cc1, text)
+
+        print('We have send email!')
+
+    def sendemail_to_me(self):
+
+        mail_host = "smtp.exmail.qq.com"  # 设置服务器
+        mail_user = "jinlong.diao@amberaigroup.com"  # 用户名
+        mail_pass = ":Diao1111"  # 口令
+
+        sender = 'jinlong.diao@amberaigroup.com'
+        to = 'trading@amberaigroup.com'
+
+        receivers = ['11510422@mail.sustc.edu.cn']  # 接收邮件，可设置为你的QQ邮箱或者其他邮箱
+        cc1 = ['445609506@qq.com']
+
+        server = smtplib.SMTP_SSL(mail_host)
+        server.set_debuglevel(1)
+        server.ehlo(mail_host)
+        server.ehlo()
+
+        server.login(mail_user, mail_pass)
+        msg = MIMEMultipart()
+
+        msg['From'] = sender
+        msg['To'] = to
+        now = datetime.now().strftime('%Y-%m-%d')
+        msg['Subject'] = "KRYPTONO-AMBER MARKET MAKING_" + now
+
+        part = MIMEText('Code is still running.orz~\nCode is still running.orz~\n\n Don`t worry!')
+        msg.attach(part)
+
+        text = msg.as_string()
+        server.sendmail(sender, receivers, text)
+        server.sendmail(sender, cc1, text)
+
+        print('We have send email!')
+
+    def excute(self):
+
+        global symbol
+        global keydict
+        global account_name
+        global keydict_huo
+        global account_name_huo
+        # symbol = []
+        symbol = []
+
+        # keydict = {"apiKey": []
+        #    ,
+        #            "apiSecret": []}
+        # account_name = []
+        keydict = {"apiKey": []}
+        account_name = []
+        keydict_huo = {"apiKey": [
+                    "apiSecret": []}
+        account_name_huo = []
+        # self.sendemail()
+
+        while True:
+
+            global today
+            global filename
+            global dir_path
+            global original_balance_huo
+            global balance_data_code_huo
+            # today = datetime.now().strftime('%Y-%m-%d')
+            today = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+            filename = 'Daily_MM_Report_' + today + '.xls'
+            dir_path = '/home/user/LUKE_summary/'
+
+            print('=============')
+
+            # Here, we writed the original balance to the excel Original_balance_huo.xls
+            while True:
+                try:
+
+                    original_balance_huo1 = self.get_balance(keydict_huo['apiKey'][0], keydict_huo['apiSecret'][0], account_name_huo[0])
+                    balance_data_code_huo = np.array(original_balance_huo1['Currency_code']).tolist()
+                    balance_data_bal_1 = np.array(original_balance_huo1['Balance'], dtype=np.float)
+
+                    original_balance_huo2 = self.get_balance(keydict_huo['apiKey'][1], keydict_huo['apiSecret'][1], account_name_huo[1])
+                    # balance_data_code = np.array(original_balance_huo2['Currency_code']).tolist()
+                    balance_data_bal_2 = np.array(original_balance_huo2['Balance'], dtype=np.float)
+
+                    original_balance_huo = balance_data_bal_1 + balance_data_bal_2
+                    # print(balance_data_code_huo)
+                    # print(balance_data_bal_1)
+                    # print(balance_data_bal_2)
+                    # print(original_balance_huo)
+                    original = pd.DataFrame({
+                        'balance_data_code_huo': balance_data_code_huo,
+                        'original_balance_huo':original_balance_huo.tolist()
+                    })
+                    original.to_excel(dir_path + 'Original_balance_huo.xls')
+                    print('Original Banlance is writed succesfully.')
+                    break
+                except Exception as e:
+                    print(e)
+                    ti.sleep(5)
+
+
+            d1 = datetime.now()
+            print(d1)
+
+            # self.first_loop(keydict, account_name, symbol)
+
+            # Here, we try the first loop.
+            while True:
+                try:
+                    self.first_loop(keydict, account_name, symbol)
+                    print('Write the first trade list succesfully! Congratulations!')
+                    break
+                except:
+                    ti.sleep(5)
+                    print('Write the first trade list unsuccesfully, try again!')
+
+            while True:
+
+                # self.writeExcel(keydict, account_name, symbol)
+
+                try:
+                    self.writeExcel(keydict, account_name, symbol)
+                except Exception as e:
+                    print('*******************')
+                    print(e)
+                    print('*******************')
+                    ti.sleep(20)
+                    pass
+
+                ti.sleep(200)
+                d2 = datetime.now()
+                delta = (d2 - d1).seconds
+                # time_count += 60
+                # if time_count >= 1200:
+                #     self.sendemail_to_me()
+                #     break
+                print('Time left: ', (23.5 * 3600) - delta)
+
+                if delta >= 23.5 * 3600:
+                    for account in account_name:
+
+                        # balance_data = self.get_balance(keydict['apiKey'][0], keydict['apiSecret'][0], account_name[0])
+                        # balance_data_code = np.array(balance_data['Currency_code']).tolist()
+                        # balance_data_bal = np.array(balance_data['Balance']).tolist()
+                        #
+                        # print('11111111111111111111111')
+                        # currency_pair, volume = self.sym_sum(account_name)
+                        # print(volume)
+
+                        xls = xlrd.open_workbook('/home/user/LUKE_summary/' + filename, formatting_info=True)
+                        w = copy(xls)
+                        print('11111111111111111111111')
+
+                        # w.get_sheet(0).write(0, 0, 'Currency_code')
+                        # w.get_sheet(0).write(0, 1, 'Balance')
+                        # w.get_sheet(0).write(0, 2, '')
+                        # for i in range(len(balance_data_code)):
+                        #     w.get_sheet(0).write(i + 1, 0, balance_data_code[i])
+                        #     w.get_sheet(0).write(i + 1, 1, balance_data_bal[i])
+                        #     w.get_sheet(0).write(i + 1, 2, '')
+                        #
+                        #
+                        # w.get_sheet(0).write(6, 0, "Volume")
+                        # w.get_sheet(0).write(7, 0, "currency_pair")
+                        # w.get_sheet(0).write(7, 1, "volume")
+                        # for i in range(len(volume)):
+                        #     w.get_sheet(0).write(i + 8, 0, currency_pair[i])
+                        #     w.get_sheet(0).write(i + 8, 1, volume[i])
+                        Report_Dir_Path = '/home/user/LUKE_Daily_Report/'
+                        w.save(Report_Dir_Path + filename)
+
+                        del xls, w
+                        gc.collect()
+
+                        d3 = datetime.now()
+                        delta2 = (d3 - d2).seconds
+                        print(delta2)
+
+                    break
+
+            self.sendemail_to_clients()
+            delDir = Report_Dir_Path
+            delList = os.listdir(delDir)
+            for f in delList:
+                filePath = os.path.join(delDir,f)
+                print(f)
+                if os.path.isfile(filePath):
+                    os.remove(filePath)
+                    print(filePath + 'was removed!')
+            print('another day')
+            break
+
+
+data = Dailyreport()
+data.excute()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
